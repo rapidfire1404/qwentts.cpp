@@ -25,6 +25,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static void print_usage(const char * prog) {
@@ -255,16 +256,16 @@ static int run_loop(const Args & a) {
     }
     fprintf(stderr, "[Loop] Model loaded, entering request loop\n");
 
-    std::string last_ref_wav;
+    struct CachedVoice {
+        std::vector<float>   ref_buf;
+        int                  ref_n_samples = 0;
+        std::vector<float>   spk_emb;
+        std::vector<int32_t> ref_codes;
+        int                  ref_codes_T = 0;
+    };
+    std::unordered_map<std::string, CachedVoice> voice_cache;
     std::string last_ref_text;
-    int         ref_n_samples = 0;
-    std::unique_ptr<float, decltype(&std::free)> ref_buf(nullptr, std::free);
     std::string ref_text_buf;
-
-    // Cached pre-computed voice data (cleared whenever ref_wav changes)
-    std::vector<float>    cached_spk_emb;
-    std::vector<int32_t>  cached_ref_codes;
-    int                   cached_ref_codes_T = 0;
 
     uint32_t req_len = 0;
     while (fread(&req_len, 4, 1, stdin) == 1) {
@@ -310,46 +311,46 @@ static int run_loop(const Args & a) {
             continue;
         }
 
-        // Load reference audio if changed, and recompute cached voice data
-        if (ref_wav != last_ref_wav) {
+        // Look up or create cached voice entry for this ref_wav
+        auto cache_it = voice_cache.find(ref_wav);
+        if (cache_it == voice_cache.end()) {
             int T = 0;
             float * raw = audio_read_mono(ref_wav.c_str(), 24000, &T);
             if (!raw || T <= 0) {
                 write_error("cannot read ref_wav: " + ref_wav);
                 continue;
             }
-            ref_buf.reset(raw);
-            ref_n_samples = T;
-            last_ref_wav  = ref_wav;
 
-            // Invalidate caches and recompute on the new audio
-            cached_spk_emb.clear();
-            cached_ref_codes.clear();
-            cached_ref_codes_T = 0;
+            CachedVoice cv;
+            cv.ref_buf.assign(raw, raw + T);
+            cv.ref_n_samples = T;
+            std::free(raw);
 
-            if (ref_n_samples > 0 && q->pt.has_speaker_encoder) {
+            if (cv.ref_n_samples > 0 && q->pt.has_speaker_encoder) {
                 if (!speaker_encoder_extract(&q->pt.speaker_encoder, q->pt.sched,
-                                             ref_buf.get(), ref_n_samples,
-                                             cached_spk_emb, nullptr)) {
+                                             cv.ref_buf.data(), cv.ref_n_samples,
+                                             cv.spk_emb, nullptr)) {
                     fprintf(stderr, "[Loop] WARNING: speaker_encoder_extract failed for %s\n", ref_wav.c_str());
-                    cached_spk_emb.clear();
                 } else {
                     fprintf(stderr, "[Loop] Cached %zu-dim speaker embedding for %s\n",
-                            cached_spk_emb.size(), ref_wav.c_str());
+                            cv.spk_emb.size(), ref_wav.c_str());
                 }
             }
 
-            if (ref_n_samples >= TOKENIZER_HOP_LENGTH) {
-                int aligned_T = (ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
-                cached_ref_codes = pipeline_codec_encode(&q->pt.codec, ref_buf.get(), aligned_T, nullptr);
-                if (!cached_ref_codes.empty()) {
-                    cached_ref_codes_T = (int)cached_ref_codes.size() / q->pt.num_code_groups;
+            if (cv.ref_n_samples >= TOKENIZER_HOP_LENGTH) {
+                int aligned_T = (cv.ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
+                cv.ref_codes = pipeline_codec_encode(&q->pt.codec, cv.ref_buf.data(), aligned_T, nullptr);
+                if (!cv.ref_codes.empty()) {
+                    cv.ref_codes_T = (int)cv.ref_codes.size() / q->pt.num_code_groups;
                     fprintf(stderr, "[Loop] Cached %d codec frames for %s\n",
-                            cached_ref_codes_T, ref_wav.c_str());
+                            cv.ref_codes_T, ref_wav.c_str());
                 } else {
                     fprintf(stderr, "[Loop] WARNING: pipeline_codec_encode failed for %s\n", ref_wav.c_str());
                 }
             }
+
+            auto result = voice_cache.emplace(ref_wav, std::move(cv));
+            cache_it = result.first;
         }
 
         // Load reference text if changed
@@ -369,8 +370,8 @@ static int run_loop(const Args & a) {
         params.lang                = lang.empty() ? "english" : lang.c_str();
         params.instruct            = instruct.empty() ? nullptr : instruct.c_str();
         params.speaker             = speaker.empty() ? nullptr : speaker.c_str();
-        params.ref_audio_24k       = ref_buf.get();
-        params.ref_n_samples       = ref_n_samples;
+        params.ref_audio_24k       = cache_it->second.ref_buf.data();
+        params.ref_n_samples       = cache_it->second.ref_n_samples;
         params.ref_text            = ref_text_buf.empty() ? nullptr : ref_text_buf.c_str();
         params.seed                = json_int64(req, "seed", -1);
         params.max_new_tokens      = (int)json_int64(req, "max_new", 2048);
@@ -378,13 +379,14 @@ static int run_loop(const Args & a) {
         params.on_chunk            = stream_chunk_cb;
 
         // Wire in cached voice data so pipeline_tts_synthesize skips recomputation
-        if (!cached_spk_emb.empty()) {
-            params.ref_spk_emb     = cached_spk_emb.data();
-            params.ref_spk_emb_dim = (int)cached_spk_emb.size();
+        auto & cv = cache_it->second;
+        if (!cv.spk_emb.empty()) {
+            params.ref_spk_emb     = cv.spk_emb.data();
+            params.ref_spk_emb_dim = (int)cv.spk_emb.size();
         }
-        if (!cached_ref_codes.empty()) {
-            params.ref_codes              = cached_ref_codes.data();
-            params.ref_codes_T            = cached_ref_codes_T;
+        if (!cv.ref_codes.empty()) {
+            params.ref_codes              = cv.ref_codes.data();
+            params.ref_codes_T            = cv.ref_codes_T;
             params.ref_codes_num_codebooks = q->pt.num_code_groups;
         }
 
