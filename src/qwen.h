@@ -57,7 +57,7 @@ extern "C" {
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
 // matters.
-#define QT_ABI_VERSION 1
+#define QT_ABI_VERSION 2
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -267,6 +267,24 @@ struct qt_tts_params {
     // clamps to >= 0 frames.
     float codec_chunk_sec;
     float codec_left_context_sec;
+
+    // Pre-computed voice clone data. New in ABI v2. When non-NULL,
+    // pipeline_tts_synthesize skips recomputing the speaker embedding
+    // and/or codec codes from ref_audio_24k/ref_text and uses these
+    // values directly. Ignored (auto-compute) when NULL. Both fields
+    // must be set together or the auto path runs for each half:
+    //
+    //   ref_spk_emb     [hidden_size] f32  — skips speaker_encoder_extract
+    //   ref_spk_emb_dim == hidden_size (checked)
+    //
+    //   ref_codes       [num_code_groups * T] i32 — skips pipeline_codec_encode
+    //   ref_codes_T     number of codec frames
+    //   ref_codes_num_codebooks  == num_code_groups (checked)
+    const float * ref_spk_emb;
+    int           ref_spk_emb_dim;
+    const int32_t * ref_codes;
+    int           ref_codes_T;
+    int           ref_codes_num_codebooks;
 };
 
 // Initialise to the standard defaults. Strings NULL, seed -1,

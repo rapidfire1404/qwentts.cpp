@@ -218,6 +218,11 @@ void qt_tts_default_params(struct qt_tts_params * p) {
     p->on_chunk_user_data     = nullptr;
     p->codec_chunk_sec        = 24.0f;
     p->codec_left_context_sec = 2.0f;
+    p->ref_spk_emb            = nullptr;
+    p->ref_spk_emb_dim        = 0;
+    p->ref_codes              = nullptr;
+    p->ref_codes_T            = 0;
+    p->ref_codes_num_codebooks = 0;
 }
 
 struct qt_context * qt_init(const struct qt_init_params * params) {

@@ -332,27 +332,39 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
     // embedding straight into the prompt builder. Mutually exclusive
     // with --speaker.
     const bool         has_ref_audio = (params->ref_audio_24k != NULL) && (params->ref_n_samples > 0);
-    std::vector<float> ref_spk_emb;
+    std::vector<float> ref_spk_emb_local;
     const float *      ref_spk_emb_ptr = NULL;
     if (has_ref_audio) {
-        if (!pt->has_speaker_encoder) {
-            qt_set_error(
-                "pipeline_tts_synthesize: --ref-wav requires a model with a loaded speaker encoder (Base only)");
-            qt_log(QT_LOG_ERROR, "[Pipeline] --ref-wav requires a model with a loaded speaker encoder (Base only)");
-            return QT_STATUS_GENERATE_FAILED;
+        // Pre-computed embedding path (ABI v2+, set by --loop daemon cache).
+        if (params->abi_version >= 2 && params->ref_spk_emb != NULL) {
+            if (params->ref_spk_emb_dim != pt->talker.hidden_size) {
+                qt_set_error("pipeline_tts_synthesize: pre-computed speaker embedding dim %d mismatches hidden %d",
+                             params->ref_spk_emb_dim, pt->talker.hidden_size);
+                qt_log(QT_LOG_ERROR, "[Pipeline] pre-computed speaker embedding dim %d mismatches hidden %d",
+                       params->ref_spk_emb_dim, pt->talker.hidden_size);
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            ref_spk_emb_ptr = params->ref_spk_emb;
+            qt_log(QT_LOG_INFO, "[Pipeline] Using cached speaker embedding (%d dim)", params->ref_spk_emb_dim);
+        } else {
+            if (!pt->has_speaker_encoder) {
+                qt_set_error("pipeline_tts_synthesize: --ref-wav requires a model with a loaded speaker encoder (Base only)");
+                qt_log(QT_LOG_ERROR, "[Pipeline] --ref-wav requires a model with a loaded speaker encoder (Base only)");
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            if (!speaker_encoder_extract(&pt->speaker_encoder, pt->sched, params->ref_audio_24k, params->ref_n_samples,
+                                         ref_spk_emb_local, params->dump_dir)) {
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            if ((int) ref_spk_emb_local.size() != pt->talker.hidden_size) {
+                qt_set_error("pipeline_tts_synthesize: speaker embedding size %zu mismatches talker hidden %d",
+                             ref_spk_emb_local.size(), pt->talker.hidden_size);
+                qt_log(QT_LOG_ERROR, "[Pipeline] speaker embedding size %zu mismatches talker hidden %d",
+                       ref_spk_emb_local.size(), pt->talker.hidden_size);
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            ref_spk_emb_ptr = ref_spk_emb_local.data();
         }
-        if (!speaker_encoder_extract(&pt->speaker_encoder, pt->sched, params->ref_audio_24k, params->ref_n_samples,
-                                     ref_spk_emb, params->dump_dir)) {
-            return QT_STATUS_GENERATE_FAILED;
-        }
-        if ((int) ref_spk_emb.size() != pt->talker.hidden_size) {
-            qt_set_error("pipeline_tts_synthesize: speaker embedding size %zu mismatches talker hidden %d",
-                         ref_spk_emb.size(), pt->talker.hidden_size);
-            qt_log(QT_LOG_ERROR, "[Pipeline] speaker embedding size %zu mismatches talker hidden %d",
-                   ref_spk_emb.size(), pt->talker.hidden_size);
-            return QT_STATUS_GENERATE_FAILED;
-        }
-        ref_spk_emb_ptr = ref_spk_emb.data();
     }
 
     // Voice clone mode B: if ref_text is also given, encode the
@@ -360,35 +372,51 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
     // Layout returned by pipeline_codec_encode is [num_codebooks, T_codec]
     // row major, matching what the prompt builder expects for the ICL
     // sum loop.
-    std::vector<int32_t> ref_codes;
+    std::vector<int32_t> ref_codes_local;
     int                  ref_codes_T = 0;
+    const int32_t *      ref_codes_ptr = NULL;
     if (!ref_text.empty()) {
         if (!has_ref_audio) {
             qt_set_error("pipeline_tts_synthesize: --ref-text requires --ref-wav");
             qt_log(QT_LOG_ERROR, "[Pipeline] --ref-text requires --ref-wav");
             return QT_STATUS_INVALID_PARAMS;
         }
-        // The codec hop is 1920 samples at 24 kHz so n_samples must be
-        // a multiple of 1920. Truncate to the nearest hop boundary.
-        if (params->ref_n_samples < TOKENIZER_HOP_LENGTH) {
-            qt_set_error("pipeline_tts_synthesize: ref_wav too short for ICL (%d samples)", params->ref_n_samples);
-            qt_log(QT_LOG_ERROR, "[Pipeline] ref_wav too short for ICL (%d samples)", params->ref_n_samples);
-            return QT_STATUS_INVALID_PARAMS;
+        // Pre-computed codes path (ABI v2+, set by --loop daemon cache).
+        if (params->abi_version >= 2 && params->ref_codes != NULL) {
+            if (params->ref_codes_num_codebooks != pt->num_code_groups) {
+                qt_set_error("pipeline_tts_synthesize: pre-computed codes num_codebooks %d mismatches %d",
+                             params->ref_codes_num_codebooks, pt->num_code_groups);
+                qt_log(QT_LOG_ERROR, "[Pipeline] pre-computed codes num_codebooks %d mismatches %d",
+                       params->ref_codes_num_codebooks, pt->num_code_groups);
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            ref_codes_ptr = params->ref_codes;
+            ref_codes_T   = params->ref_codes_T;
+            qt_log(QT_LOG_INFO, "[Pipeline] Using cached codec codes: %d frames", ref_codes_T);
+        } else {
+            // The codec hop is 1920 samples at 24 kHz so n_samples must be
+            // a multiple of 1920. Truncate to the nearest hop boundary.
+            if (params->ref_n_samples < TOKENIZER_HOP_LENGTH) {
+                qt_set_error("pipeline_tts_synthesize: ref_wav too short for ICL (%d samples)", params->ref_n_samples);
+                qt_log(QT_LOG_ERROR, "[Pipeline] ref_wav too short for ICL (%d samples)", params->ref_n_samples);
+                return QT_STATUS_INVALID_PARAMS;
+            }
+            int aligned_T = (params->ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
+            ref_codes_local = pipeline_codec_encode(&pt->codec, params->ref_audio_24k, aligned_T, params->dump_dir);
+            if (ref_codes_local.empty()) {
+                qt_set_error("pipeline_tts_synthesize: pipeline_codec_encode returned empty codes");
+                qt_log(QT_LOG_ERROR, "[Pipeline] pipeline_codec_encode returned empty codes");
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            ref_codes_ptr = ref_codes_local.data();
+            ref_codes_T   = (int) ref_codes_local.size() / pt->num_code_groups;
+            qt_log(QT_LOG_INFO, "[Pipeline] ICL ref_codes: %d frames at 12.5 Hz (%d audio samples)", ref_codes_T,
+                   aligned_T);
         }
-        int aligned_T = (params->ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
-        ref_codes     = pipeline_codec_encode(&pt->codec, params->ref_audio_24k, aligned_T, params->dump_dir);
-        if (ref_codes.empty()) {
-            qt_set_error("pipeline_tts_synthesize: pipeline_codec_encode returned empty codes");
-            qt_log(QT_LOG_ERROR, "[Pipeline] pipeline_codec_encode returned empty codes");
-            return QT_STATUS_GENERATE_FAILED;
-        }
-        ref_codes_T = (int) ref_codes.size() / pt->num_code_groups;
-        qt_log(QT_LOG_INFO, "[Pipeline] ICL ref_codes: %d frames at 12.5 Hz (%d audio samples)", ref_codes_T,
-               aligned_T);
     }
 
     if (!prompt_builder_build(pt, tok, params->text, params->lang, instruct, speaker, ref_spk_emb_ptr, ref_text,
-                              ref_codes_T > 0 ? ref_codes.data() : NULL, ref_codes_T, &prompt)) {
+                              ref_codes_ptr, ref_codes_T, &prompt)) {
         return QT_STATUS_GENERATE_FAILED;
     }
 
@@ -411,7 +439,7 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
         }
         if (ref_codes_T > 0) {
             const int shape[2] = { pt->num_code_groups, ref_codes_T };
-            debug_dump_i32_as_f32(&d, "ref-codes", ref_codes.data(), shape, 2);
+            debug_dump_i32_as_f32(&d, "ref-codes", ref_codes_ptr, shape, 2);
         }
     }
 

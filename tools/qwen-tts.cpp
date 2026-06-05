@@ -13,6 +13,10 @@
 
 #include "audio-io.h"
 #include "qwen.h"
+#include "pipeline-codec.h"
+#include "pipeline-tts.h"
+#include "qwen-internal.h"
+#include "speaker-encoder-extract.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +25,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 static void print_usage(const char * prog) {
     fprintf(stderr, "qwentts.cpp %s\n\n", qt_version());
@@ -56,7 +61,11 @@ static void print_usage(const char * prog) {
             "Debug:\n"
             "  --no-fa                 Disable flash attention\n"
             "  --clamp-fp16            Clamp hidden states + V to FP16 range\n"
-            "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n",
+            "  --dump <dir>            Dump intermediate tensors (f32) to <dir>\n\n"
+            "Daemon (--loop):\n"
+            "  --loop                  Keep model loaded; read requests via stdin loop.\n"
+            "                          Binary protocol: [4B LE json_len][json][4B LE status]\n"
+            "                          [4B LE meta_len][meta][streaming chunks][4B LE 0].\n",
             prog);
 }
 
@@ -86,6 +95,7 @@ struct Args {
     bool         clamp_fp16;
     float        codec_chunk_sec;
     float        codec_left_context_sec;
+    bool         loop;
 };
 
 // Read all of stdin into a string. Trims trailing newlines so a piped
@@ -128,6 +138,290 @@ static bool read_text_file(const char * path, std::string & out) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Minimal JSON helpers for the --loop daemon protocol (flat objects only)
+// ---------------------------------------------------------------------------
+static std::string json_str(const std::string & s, const std::string & key) {
+    std::string needle = "\"" + key + "\":\"";
+    auto pos = s.find(needle);
+    if (pos == std::string::npos) return {};
+    pos += needle.size();
+    std::string out;
+    bool esc = false;
+    for (; pos < s.size(); pos++) {
+        if (esc) {
+            switch (s[pos]) {
+                case '"':  out += '"';  break;
+                case '\\': out += '\\'; break;
+                case 'n':  out += '\n'; break;
+                case 't':  out += '\t'; break;
+                case 'r':  out += '\r'; break;
+                default:   out += s[pos]; break;
+            }
+            esc = false;
+        } else if (s[pos] == '\\') {
+            esc = true;
+        } else if (s[pos] == '"') {
+            break;
+        } else {
+            out += s[pos];
+        }
+    }
+    return out;
+}
+
+static int64_t json_int64(const std::string & s, const std::string & key, int64_t def) {
+    auto p = s.find("\"" + key + "\":");
+    if (p == std::string::npos) return def;
+    p += key.size() + 3;
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) p++;
+    if (s.substr(p, 4) == "null" || s.substr(p, 4) == "NULL") return def;
+    char * end = nullptr;
+    auto v = strtoll(s.c_str() + p, &end, 10);
+    return (end == s.c_str() + p) ? def : v;
+}
+
+static float json_float(const std::string & s, const std::string & key, float def) {
+    auto p = s.find("\"" + key + "\":");
+    if (p == std::string::npos) return def;
+    p += key.size() + 3;
+    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) p++;
+    if (s.substr(p, 4) == "null" || s.substr(p, 4) == "NULL") return def;
+    char * end = nullptr;
+    auto v = strtof(s.c_str() + p, (char **)&end);
+    return (end == s.c_str() + p) ? def : v;
+}
+
+static std::string json_escape(const std::string & s) {
+    std::string out;
+    for (auto c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming callback for the --loop daemon protocol
+// ---------------------------------------------------------------------------
+struct StreamCtx {
+    FILE * fp;
+    bool   ok;
+};
+
+static bool stream_chunk_cb(const float * samples, int n_samples, void * user_data) {
+    auto * ctx = (StreamCtx *)user_data;
+    if (!ctx->ok || n_samples <= 0) return true;
+
+    uint32_t nbytes = (uint32_t)n_samples * 2u;
+    if (fwrite(&nbytes, 4, 1, ctx->fp) != 1) {
+        ctx->ok = false;
+        return false;
+    }
+    for (int i = 0; i < n_samples; i++) {
+        float f = samples[i];
+        if (!std::isfinite(f)) f = 0.0f;
+        f = (f < -1.0f) ? -1.0f : (f > 1.0f ? 1.0f : f);
+        int16_t pcm = (int16_t)(f * 32767.0f);
+        if (fwrite(&pcm, 2, 1, ctx->fp) != 1) {
+            ctx->ok = false;
+            return false;
+        }
+    }
+    fflush(ctx->fp);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// --loop daemon: keep model alive across requests, stdin/stdout protocol
+// ---------------------------------------------------------------------------
+static int run_loop(const Args & a) {
+    qt_init_params iparams;
+    qt_init_default_params(&iparams);
+    iparams.talker_path = a.model;
+    iparams.codec_path  = a.codec;
+    iparams.use_fa      = a.use_fa;
+    iparams.clamp_fp16  = a.clamp_fp16;
+
+    qt_context * q = qt_init(&iparams);
+    if (!q) {
+        fprintf(stderr, "[Loop] ERROR: %s\n", qt_last_error());
+        return 1;
+    }
+    fprintf(stderr, "[Loop] Model loaded, entering request loop\n");
+
+    std::string last_ref_wav;
+    std::string last_ref_text;
+    int         ref_n_samples = 0;
+    std::unique_ptr<float, decltype(&std::free)> ref_buf(nullptr, std::free);
+    std::string ref_text_buf;
+
+    // Cached pre-computed voice data (cleared whenever ref_wav changes)
+    std::vector<float>    cached_spk_emb;
+    std::vector<int32_t>  cached_ref_codes;
+    int                   cached_ref_codes_T = 0;
+
+    uint32_t req_len = 0;
+    while (fread(&req_len, 4, 1, stdin) == 1) {
+        if (req_len == 0 || req_len > 1024 * 1024) {
+            fprintf(stderr, "[Loop] Invalid request length %u\n", req_len);
+            continue;
+        }
+        std::string req((size_t)req_len, '\0');
+        if (fread(&req[0], 1, req_len, stdin) != req_len) {
+            fprintf(stderr, "[Loop] Short read, exiting\n");
+            break;
+        }
+
+        std::string req_id      = json_str(req, "id");
+        std::string text        = json_str(req, "text");
+        std::string ref_wav     = json_str(req, "ref_wav");
+        std::string ref_txt_p   = json_str(req, "ref_text");
+        std::string lang        = json_str(req, "lang");
+        std::string instruct    = json_str(req, "instruct");
+        std::string speaker     = json_str(req, "speaker");
+
+        // Helper: write a length-prefixed binary frame to stdout
+        auto write_frame = [](const void * data, uint32_t len) {
+            if (fwrite(&len, 4, 1, stdout) == 1) {
+                if (len > 0) fwrite(data, 1, len, stdout);
+            }
+            fflush(stdout);
+        };
+
+        auto write_error = [&](const std::string & msg) {
+            std::string err = "{\"id\":\"" + json_escape(req_id) +
+                              "\",\"error\":\"" + json_escape(msg) + "\"}";
+            uint32_t st = 1;
+            fwrite(&st, 4, 1, stdout);
+            write_frame(err.data(), (uint32_t)err.size());
+            uint32_t zero = 0;
+            fwrite(&zero, 4, 1, stdout);
+            fflush(stdout);
+        };
+
+        if (req_id.empty() || text.empty()) {
+            write_error("missing id or text");
+            continue;
+        }
+
+        // Load reference audio if changed, and recompute cached voice data
+        if (ref_wav != last_ref_wav) {
+            int T = 0;
+            float * raw = audio_read_mono(ref_wav.c_str(), 24000, &T);
+            if (!raw || T <= 0) {
+                write_error("cannot read ref_wav: " + ref_wav);
+                continue;
+            }
+            ref_buf.reset(raw);
+            ref_n_samples = T;
+            last_ref_wav  = ref_wav;
+
+            // Invalidate caches and recompute on the new audio
+            cached_spk_emb.clear();
+            cached_ref_codes.clear();
+            cached_ref_codes_T = 0;
+
+            if (ref_n_samples > 0 && q->pt.has_speaker_encoder) {
+                if (!speaker_encoder_extract(&q->pt.speaker_encoder, q->pt.sched,
+                                             ref_buf.get(), ref_n_samples,
+                                             cached_spk_emb, nullptr)) {
+                    fprintf(stderr, "[Loop] WARNING: speaker_encoder_extract failed for %s\n", ref_wav.c_str());
+                    cached_spk_emb.clear();
+                } else {
+                    fprintf(stderr, "[Loop] Cached %zu-dim speaker embedding for %s\n",
+                            cached_spk_emb.size(), ref_wav.c_str());
+                }
+            }
+
+            if (ref_n_samples >= TOKENIZER_HOP_LENGTH) {
+                int aligned_T = (ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
+                cached_ref_codes = pipeline_codec_encode(&q->pt.codec, ref_buf.get(), aligned_T, nullptr);
+                if (!cached_ref_codes.empty()) {
+                    cached_ref_codes_T = (int)cached_ref_codes.size() / q->pt.num_code_groups;
+                    fprintf(stderr, "[Loop] Cached %d codec frames for %s\n",
+                            cached_ref_codes_T, ref_wav.c_str());
+                } else {
+                    fprintf(stderr, "[Loop] WARNING: pipeline_codec_encode failed for %s\n", ref_wav.c_str());
+                }
+            }
+        }
+
+        // Load reference text if changed
+        if (ref_txt_p != last_ref_text) {
+            ref_text_buf.clear();
+            if (!ref_txt_p.empty() && !read_text_file(ref_txt_p.c_str(), ref_text_buf)) {
+                write_error("cannot read ref_text: " + ref_txt_p);
+                continue;
+            }
+            last_ref_text = ref_txt_p;
+        }
+
+        // Build synthesis params
+        qt_tts_params params;
+        qt_tts_default_params(&params);
+        params.text                = text.c_str();
+        params.lang                = lang.empty() ? "english" : lang.c_str();
+        params.instruct            = instruct.empty() ? nullptr : instruct.c_str();
+        params.speaker             = speaker.empty() ? nullptr : speaker.c_str();
+        params.ref_audio_24k       = ref_buf.get();
+        params.ref_n_samples       = ref_n_samples;
+        params.ref_text            = ref_text_buf.empty() ? nullptr : ref_text_buf.c_str();
+        params.seed                = json_int64(req, "seed", -1);
+        params.max_new_tokens      = (int)json_int64(req, "max_new", 2048);
+        params.codec_chunk_sec     = json_float(req, "codec_chunk_sec", 0.5f);
+        params.on_chunk            = stream_chunk_cb;
+
+        // Wire in cached voice data so pipeline_tts_synthesize skips recomputation
+        if (!cached_spk_emb.empty()) {
+            params.ref_spk_emb     = cached_spk_emb.data();
+            params.ref_spk_emb_dim = (int)cached_spk_emb.size();
+        }
+        if (!cached_ref_codes.empty()) {
+            params.ref_codes              = cached_ref_codes.data();
+            params.ref_codes_T            = cached_ref_codes_T;
+            params.ref_codes_num_codebooks = q->pt.num_code_groups;
+        }
+
+        StreamCtx sctx = {stdout, true};
+        params.on_chunk_user_data = &sctx;
+
+        // Write success header
+        uint32_t st = 0;
+        fwrite(&st, 4, 1, stdout);
+        std::string meta = "{\"id\":\"" + json_escape(req_id) +
+                           "\",\"sample_rate\":24000}";
+        uint32_t mlen = (uint32_t)meta.size();
+        fwrite(&mlen, 4, 1, stdout);
+        fwrite(meta.data(), 1, mlen, stdout);
+
+        // Run synthesis (streaming via on_chunk callback)
+        qt_audio audio = {};
+        qt_status status = qt_synthesize(q, &params, &audio);
+        qt_audio_free(&audio);
+
+        // Write zero-length chunk terminator
+        uint32_t zero = 0;
+        fwrite(&zero, 4, 1, stdout);
+        fflush(stdout);
+
+        if (status != QT_STATUS_OK) {
+            fprintf(stderr, "[Loop] Synthesis failed: %s\n", qt_last_error());
+        } else {
+            fprintf(stderr, "[Loop] Synthesized request %s\n", req_id.c_str());
+        }
+    }
+
+    fprintf(stderr, "[Loop] Exiting\n");
+    qt_free(q);
+    return 0;
+}
+
 static bool parse_args(int argc, char ** argv, Args & a) {
     a                        = {};
     a.lang                   = "english";
@@ -147,6 +441,7 @@ static bool parse_args(int argc, char ** argv, Args & a) {
     a.clamp_fp16             = false;
     a.codec_chunk_sec        = 24.0f;
     a.codec_left_context_sec = 2.0f;
+    a.loop                   = false;
     for (int i = 1; i < argc; i++) {
         const char * arg = argv[i];
         if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
@@ -204,6 +499,8 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.codec_chunk_sec = (float) std::atof(argv[++i]);
         } else if (std::strcmp(arg, "--codec-left-dur") == 0 && i + 1 < argc) {
             a.codec_left_context_sec = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--loop") == 0) {
+            a.loop = true;
         } else if (std::strcmp(arg, "-o") == 0 && i + 1 < argc) {
             a.out_wav = argv[++i];
         } else {
@@ -389,5 +686,8 @@ int main(int argc, char ** argv) {
     // qt_last_error message. No top-level try / catch needed here :
     // the CLI just reads the status returned by qt_init /
     // qt_synthesize and renders qt_last_error to stderr.
+    if (a.loop) {
+        return run_loop(a);
+    }
     return run(a);
 }
